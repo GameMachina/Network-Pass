@@ -1,0 +1,6 @@
+{
+  "name": "Network Pass",
+  "description": "A mobile-first web app to verify Network School membership and claim partner discounts.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": []
+}
