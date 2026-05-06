@@ -1,38 +1,37 @@
 import express from "express";
 import { createServer as createViteServer } from "vite";
 import path from "path";
+import fs from "fs";
+import admin from "firebase-admin";
 
+admin.initializeApp({ projectId: "gen-lang-client-0107261838" });
+const db = admin.firestore();
+db.settings({ databaseId: "ai-studio-9c567fd4-5e38-4ab1-949d-714df054d7a1" });
+
+// ─── Discord OAuth constants ──────────────────────────────────────────────────
 const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID || "1499744310667509793";
 const DISCORD_CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET || "DGor2BOU4xj-SDZpnd3oJo5LE2rWPa7j";
-const NS_AUTH_API_KEY = process.env.NS_AUTH_API_KEY || "nsauth_QMVI96jizkxs-lFOjDFzv7K8CQVfbDtoI8EKIECFVJU";
+const NETWORK_SCHOOL_GUILD_ID = "900827411917201418";
 
+// ─── Server ───────────────────────────────────────────────────────────────────
 async function startServer() {
   const app = express();
   const PORT = 3000;
-  
+
   app.use(express.json());
 
-  // OAuth endpoint that gives the authorize URL
-  app.get('/api/auth/url', (req, res) => {
-    // We construct the redirect URI using the host from the request or provide instructions
-    // AI studio routes the request, so we can use the origin from the request headers if available, or just send a relative URL and frontend handles it.
-    // Wait, the frontend calls this and passes the redirect URI? 
-    // Yes, that's better securely.
+  // ── Auth: Get Discord OAuth URL ──────────────────────────────────────────
+  app.get("/api/auth/url", (req, res) => {
     res.json({ client_id: DISCORD_CLIENT_ID });
   });
 
-  // Callback handler for Discord OAuth
-  app.get(['/auth/callback', '/auth/callback/'], async (req, res) => {
+  // ── Auth: OAuth Callback (passes code to frontend) ───────────────────────
+  app.get(["/auth/callback", "/auth/callback/"], async (req, res) => {
     const { code } = req.query;
-    
-    // Send success message to parent window and close popup
     res.send(`
       <html>
         <body>
           <script>
-            // We just pass the code. The main window will do the verification
-            // so we don't block the popup. Or we can exchange here. 
-            // Better to exchange here!
             if (window.opener && window.opener !== window) {
               window.opener.postMessage({ type: 'OAUTH_AUTH_CODE', code: '${code}' }, '*');
               window.close();
@@ -40,132 +39,204 @@ async function startServer() {
               window.location.href = '/?code=${code}';
             }
           </script>
-          <p>Authentication successful. Completing login...</p>
         </body>
       </html>
     `);
   });
 
-  // Verification endpoint called by the frontend after receiving the code
-  app.post('/api/auth/verify', async (req, res) => {
+  // ── Auth: Verify Discord code and return user ─────────────────────────────
+  app.post("/api/auth/verify", async (req, res) => {
     try {
       const { code, redirectUri } = req.body;
-      
-      if (!code) {
-        return res.status(400).json({ error: "Missing code" });
-      }
+      if (!code) return res.status(400).json({ error: "Missing code" });
 
-      // Step 1: Exchange Discord code for token
+      // 1. Exchange code for Discord token
       const tokenParams = new URLSearchParams({
         client_id: DISCORD_CLIENT_ID,
         client_secret: DISCORD_CLIENT_SECRET,
-        grant_type: 'authorization_code',
-        code: code,
+        grant_type: "authorization_code",
+        code,
         redirect_uri: redirectUri
       });
 
-      const tokenRes = await fetch('https://discord.com/api/v10/oauth2/token', {
-        method: 'POST',
+      const tokenRes = await fetch("https://discord.com/api/v10/oauth2/token", {
+        method: "POST",
         headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          'User-Agent': 'NetworkPassApp (https://networkschool.com, 1.0.0)'
+          "Content-Type": "application/x-www-form-urlencoded",
+          "User-Agent": "NetworkPassApp (https://networkschool.com, 1.0.0)"
         },
         body: tokenParams
       });
-      
-      const tokenText = await tokenRes.text();
-      let tokenData;
-      try {
-        tokenData = JSON.parse(tokenText);
-      } catch (e) {
-        console.error("Failed to parse token response:", tokenText);
-        return res.status(500).json({ error: `Discord Token Error: ${tokenRes.status} ${tokenRes.statusText}` });
-      }
-      
+
+      const tokenData = await tokenRes.json() as any;
       if (!tokenRes.ok) {
         console.error("Token exchange failed:", tokenData);
         return res.status(400).json({ error: `Token exchange failed: ${JSON.stringify(tokenData)}` });
       }
 
-      // Step 2: Get user info from Discord
-      const userRes = await fetch('https://discord.com/api/v10/users/@me', {
+      // 2. Get Discord user info
+      const userRes = await fetch("https://discord.com/api/v10/users/@me", {
         headers: {
           Authorization: `Bearer ${tokenData.access_token}`,
-          'User-Agent': 'NetworkPassApp (https://networkschool.com, 1.0.0)'
+          "User-Agent": "NetworkPassApp (https://networkschool.com, 1.0.0)"
         }
       });
-      
-      const userText = await userRes.text();
-      let userData;
-      try {
-        userData = JSON.parse(userText);
-      } catch (e) {
-        console.error("Failed to parse user response:", userText);
-        return res.status(500).json({ error: `Discord User Error: ${userRes.status} ${userRes.statusText}` });
-      }
-      
-      if (!userRes.ok) {
-        return res.status(400).json({ error: "Failed to get Discord user." });
-      }
+      const userData = await userRes.json() as any;
+      if (!userRes.ok) return res.status(400).json({ error: "Failed to get Discord user." });
 
-      // Step 3: Check if they are a member of Network School via Discord Guilds Member API
-      const NETWORK_SCHOOL_GUILD_ID = '900827411917201418';
-      const guildMemberRes = await fetch(`https://discord.com/api/v10/users/@me/guilds/${NETWORK_SCHOOL_GUILD_ID}/member`, {
-        headers: {
-          Authorization: `Bearer ${tokenData.access_token}`,
-          'User-Agent': 'NetworkPassApp (https://networkschool.com, 1.0.0)'
+      // 3. Verify Network School guild membership
+      const memberRes = await fetch(
+        `https://discord.com/api/v10/users/@me/guilds/${NETWORK_SCHOOL_GUILD_ID}/member`,
+        {
+          headers: {
+            Authorization: `Bearer ${tokenData.access_token}`,
+            "User-Agent": "NetworkPassApp (https://networkschool.com, 1.0.0)"
+          }
         }
-      });
-      
-      const guildMemberText = await guildMemberRes.text();
-      let guildMemberData;
-      try {
-        guildMemberData = JSON.parse(guildMemberText);
-      } catch (e) {
-        console.error("Failed to parse guild member response:", guildMemberText);
-        return res.status(500).json({ error: `Discord API Error: ${guildMemberRes.status} ${guildMemberRes.statusText}` });
+      );
+      const memberData = await memberRes.json() as any;
+      if (!memberRes.ok) {
+        return res.status(403).json({ error: "Not a member of Network School Discord." });
       }
 
-      if (!guildMemberRes.ok) {
-        console.error("Failed to fetch guild member:", guildMemberData);
-        return res.status(403).json({ error: `Not a member or lacking permissions: ${JSON.stringify(guildMemberData)}` });
-      }
-      
-      // The user is a member. We can also get their role IDs from guildMemberData.roles
-      const roleIds = guildMemberData.roles || [];
-      
-      // Identify them as a verified member if they are in the guild
-      // We don't know the exact role name mapping without a bot token, but we have their role IDs
-      
-      // Verification successful
-      return res.json({
-        member: true,
+      // 4. Firestore user storage
+      const isAdmin = userData.email === "jalen@clayboylabs.com" || userData.email === "jalendnelson@gmail.com";
+      const userPayload = {
+        id: userData.id,
         discordId: userData.id,
-        name: guildMemberData.nick || userData.global_name || userData.username,
+        name: memberData.nick || userData.global_name || userData.username,
         email: userData.email,
         discordAvatar: userData.avatar,
-        roles: ["Verified Member"], // Abstract name
-        roleIds: roleIds
-      });
-      
+        roles: ["Verified Member"],
+        roleIds: memberData.roles || [],
+        member: true,
+        memberStatus: true,
+        lastLogin: new Date().toISOString()
+      };
+
+      await db.collection("users").doc(userPayload.id).set(userPayload, { merge: true });
+
+      return res.json({ ...userPayload, isAdmin });
+
     } catch (e: any) {
-      console.error("Auth error", e);
+      console.error("Auth error:", e);
       return res.status(500).json({ error: e.message || "Internal Server Error" });
     }
   });
 
-  // Vite middleware for development
+  // ── Admin API: Get all users ──────────────────────────────────────────────
+  app.get("/api/admin/users", async (req, res) => {
+    try {
+      const snap = await db.collection("users").get();
+      const docs = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      res.json(docs);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // ── Admin API: Get all claims ─────────────────────────────────────────────
+  app.get("/api/admin/claims", async (req, res) => {
+    try {
+      const snap = await db.collection("claims").get();
+      const docs = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      docs.sort((a: any, b: any) => {
+        const timeA = a.claimedAt?._seconds ? a.claimedAt._seconds * 1000 : (a.claimedAt ? new Date(a.claimedAt).getTime() : 0);
+        const timeB = b.claimedAt?._seconds ? b.claimedAt._seconds * 1000 : (b.claimedAt ? new Date(b.claimedAt).getTime() : 0);
+        return timeB - timeA;
+      });
+      res.json(docs);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // ── Admin API: Create claim ───────────────────────────────────────────────
+  app.post("/api/admin/claims", async (req, res) => {
+    try {
+      const { userId, discordId, userName, partnerId, partnerName, offer, expiry } = req.body;
+      const newClaim = {
+        userId, discordId, userName, partnerId, partnerName, offer, expiry,
+        claimedAt: admin.firestore.FieldValue.serverTimestamp()
+      };
+      const docRef = await db.collection("claims").add(newClaim);
+      res.json({ id: docRef.id });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // ── Admin API: Get all partners ───────────────────────────────────────────
+  app.get("/api/admin/partners", async (req, res) => {
+    try {
+      const snap = await db.collection("partners").get();
+      const docs = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      docs.sort((a: any, b: any) => {
+        const timeA = a.createdAt?._seconds ? a.createdAt._seconds * 1000 : (a.createdAt ? new Date(a.createdAt).getTime() : 0);
+        const timeB = b.createdAt?._seconds ? b.createdAt._seconds * 1000 : (b.createdAt ? new Date(b.createdAt).getTime() : 0);
+        return timeB - timeA;
+      });
+      res.json(docs);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // ── Admin API: Create partner ─────────────────────────────────────────────
+  app.post("/api/admin/partners", async (req, res) => {
+    try {
+      const { name, offer, status, expiry } = req.body;
+      if (!name || !offer) return res.status(400).json({ error: "Name and offer are required" });
+      const newPartner = {
+        name, offer,
+        status: status || "Active",
+        expiry: expiry || "24",
+        createdAt: admin.firestore.FieldValue.serverTimestamp()
+      };
+      const docRef = await db.collection("partners").add(newPartner);
+      const partnerDoc = await docRef.get();
+      res.json({ id: docRef.id, ...partnerDoc.data() });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // ── Admin API: Update partner ─────────────────────────────────────────────
+  app.put("/api/admin/partners/:id", async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { name, offer, status, expiry } = req.body;
+      const updates = { name, offer, status, expiry, updatedAt: admin.firestore.FieldValue.serverTimestamp() };
+      await db.collection("partners").doc(id).update(updates);
+      res.json({ id, ...updates });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // ── Admin API: Delete partner ─────────────────────────────────────────────
+  app.delete("/api/admin/partners/:id", async (req, res) => {
+    try {
+      const { id } = req.params;
+      await db.collection("partners").doc(id).delete();
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // ── Vite middleware ───────────────────────────────────────────────────────
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
-      appType: "spa",
+      appType: "spa"
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.join(process.cwd(), 'dist');
+    const distPath = path.join(process.cwd(), "dist");
     app.use(express.static(distPath));
-    app.get('*', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
+    app.get("*", (req, res) => {
+      res.sendFile(path.join(distPath, "index.html"));
     });
   }
 
